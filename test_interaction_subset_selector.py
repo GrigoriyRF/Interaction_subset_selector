@@ -38,12 +38,25 @@ from interaction_subset_selector import (
     select_decision_threshold,
     synergy_score,
     validation_mode,
+    _bounded_reference_features,
     _event,
     _set_event_output,
 )
 
 
 class InteractionSelectorTests(unittest.TestCase):
+    def test_reference_baseline_is_bounded_by_final_feature_limit(self):
+        features = [f"f{index}" for index in range(1_145)]
+        calibration = features[:100]
+        self.assertEqual(
+            _bounded_reference_features(features, calibration, 100),
+            calibration,
+        )
+        self.assertEqual(
+            _bounded_reference_features(features[:80], calibration, 100),
+            features[:80],
+        )
+
     def test_categorical_null_contract(self):
         cfg = AppConfig.from_dict(
             {
@@ -194,6 +207,52 @@ class InteractionSelectorTests(unittest.TestCase):
             )
         self.assertEqual(config.execution.gpu_devices, ["1"])
         self.assertEqual(manager.max_parallel_trials, 1)
+
+    def test_gpu_capacity_and_device_choice_share_one_snapshot(self):
+        config = AppConfig.from_yaml("config.interaction-selector.example.yaml")
+        config.execution.parallel_trials = 1
+        config.execution.threads_per_trial = 1
+        config.execution.gpu_devices = ["0"]
+        config.resources.mode = "auto"
+        config.resources.reserve_cpu_cores = 0
+        config.resources.max_cpu_utilization = 1.0
+        config.resources.reserve_ram_gb = 0.0
+        config.resources.max_ram_utilization = 1.0
+        config.resources.estimated_ram_per_trial_gb = 1.0
+        config.resources.estimated_gpu_memory_per_trial_gb = 20.0
+        good = ResourceSnapshot(
+            time.time(), 8, 4, 8, 5.0,
+            32.0, 28.0, 0.125, 0.5,
+            [GPUResource("0", 32.0, 30.0, 0.05, "fake")],
+            "fake",
+        )
+        bad = ResourceSnapshot(
+            time.time(), 8, 4, 8, 5.0,
+            32.0, 28.0, 0.125, 0.5,
+            [GPUResource("0", 32.0, 20.0, 0.20, "fake")],
+            "fake",
+        )
+        snapshots = iter([good, good, bad])
+        calls = 0
+
+        def provider():
+            nonlocal calls
+            calls += 1
+            return next(snapshots)
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ResourceManager(
+                config, directory, snapshot_provider=provider
+            )
+            frozen = manager.snapshot()
+            allowed = manager.allowed_concurrency(
+                0, 1, "atomic_gpu_schedule", snapshot=frozen
+            )
+            devices = manager.available_gpu_devices(frozen)
+
+        self.assertEqual(allowed, 1)
+        self.assertEqual(devices, ["0"])
+        self.assertEqual(calls, 2)
 
     def test_dynamic_scheduler_obeys_live_concurrency_limit_and_order(self):
         class FakeManager:

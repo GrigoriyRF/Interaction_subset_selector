@@ -26,7 +26,7 @@ from typing import Any, Iterable, Protocol, Sequence
 
 
 INTERNAL_WEIGHT = "__selection_weight__"
-APP_VERSION = "0.10.2"
+APP_VERSION = "0.10.4"
 _STARTED_AT = time.monotonic()
 _EVENT_OUTPUT_ENABLED = True
 
@@ -296,12 +296,12 @@ class ResourceConfig:
     gpu_total_memory_gb: float | None = None
     gpu_memory_by_device_gb: dict[str, float] = field(default_factory=dict)
     reserve_gpu_memory_gb: float = 2.0
-    max_gpu_memory_utilization: float = 0.85
+    max_gpu_memory_utilization: float = 0.90
     adaptive_concurrency: bool = True
     monitoring_interval_seconds: float = 1.0
     resource_wait_timeout_seconds: float = 300.0
     calibration_enabled: bool = True
-    calibration_safety_factor: float = 1.30
+    calibration_safety_factor: float = 1.20
     estimated_ram_per_trial_gb: float | None = None
     estimated_gpu_memory_per_trial_gb: float | None = None
     hard_ram_per_trial_gb: float | None = None
@@ -1369,10 +1369,20 @@ class ResourceManager:
         )
 
     def gpu_device_available(self, device: str) -> bool:
-        return any(
-            item.device == str(device) and self._gpu_fits(item)
-            for item in self.snapshot().gpus
-        )
+        return str(device) in self.available_gpu_devices()
+
+    def available_gpu_devices(
+        self,
+        snapshot: ResourceSnapshot | None = None,
+    ) -> list[str]:
+        """Return selected GPUs that fit a trial in one coherent snapshot."""
+        current = snapshot if snapshot is not None else self.snapshot()
+        selected = set(self.execution.gpu_devices)
+        return [
+            item.device
+            for item in current.gpus
+            if item.device in selected and self._gpu_fits(item)
+        ]
 
     def _ram_additional_slots(self, snapshot: ResourceSnapshot) -> int:
         used = snapshot.ram_total_gb - snapshot.ram_available_gb
@@ -1409,20 +1419,17 @@ class ResourceManager:
         active_trials: int,
         pending_trials: int,
         event: str = "scheduler",
+        snapshot: ResourceSnapshot | None = None,
     ) -> int:
         if not self.config.enabled:
             return self.current_parallel_limit
-        snapshot = self.snapshot()
+        snapshot = snapshot if snapshot is not None else self.snapshot()
         allowed = self.current_parallel_limit
         additional_ram = self._ram_additional_slots(snapshot)
         allowed = min(allowed, active_trials + additional_ram)
         if self.task_type == "GPU" and self.execution.backend == "local":
             selected = set(self.execution.gpu_devices)
-            additional_gpu = sum(
-                1
-                for item in snapshot.gpus
-                if item.device in selected and self._gpu_fits(item)
-            )
+            additional_gpu = len(self.available_gpu_devices(snapshot))
             allowed = min(
                 allowed,
                 len(selected),
@@ -1942,6 +1949,16 @@ def configured_split_paths(cfg: AppConfig) -> dict[str, str]:
         }.items()
         if path
     }
+
+
+def _bounded_reference_features(
+    features: Sequence[str],
+    calibration_subset: Sequence[str],
+    max_features: int,
+) -> list[str]:
+    if len(features) <= max_features:
+        return list(features)
+    return list(calibration_subset[:max_features])
 
 
 def validation_mode(cfg: AppConfig) -> str:
@@ -3665,18 +3682,37 @@ class InteractionAwareSearch:
         last_progress = time.monotonic()
         last_report = last_progress
 
-        def take_device() -> str | None:
+        def take_device(eligible_devices: set[str]) -> str | None:
             if not requires_device:
                 return None
             for _ in range(len(free_devices)):
                 device = free_devices.popleft()
-                if (
-                    self.resource_manager is None
-                    or self.resource_manager.gpu_device_available(device)
-                ):
+                if device in eligible_devices:
                     return device
                 free_devices.append(device)
             return None
+
+        def resource_wait_details(
+            snapshot: ResourceSnapshot | None,
+            allowed: int,
+            eligible_devices: set[str],
+        ) -> str:
+            if self.resource_manager is None or snapshot is None:
+                return f"allowed={allowed}"
+            selected = set(self.execution.gpu_devices)
+            gpu_rows = ", ".join(
+                f"{item.device}:free={item.free_gb:.2f}GB/"
+                f"total={item.total_gb:.2f}GB"
+                for item in snapshot.gpus
+                if item.device in selected
+            ) or "none"
+            return (
+                f"allowed={allowed}; eligible_gpus="
+                f"{sorted(eligible_devices)}; gpu_per_trial="
+                f"{self.resource_manager.gpu_memory_per_trial_gb:.2f}GB; "
+                f"gpu_state=[{gpu_rows}]; ram_available="
+                f"{snapshot.ram_available_gb:.2f}GB"
+            )
 
         def close_worker(state: IsolatedWorkerState) -> None:
             state.process.join(timeout=0.25)
@@ -3752,19 +3788,46 @@ class InteractionAwareSearch:
                 ),
             )
 
+        last_snapshot: ResourceSnapshot | None = None
+        last_allowed = 0
+        last_eligible_devices: set[str] = set()
+
         while pending or running:
-            allowed = (
-                self.resource_manager.allowed_concurrency(
-                    len(running), len(pending), "process_scheduler"
+            if self.resource_manager is not None:
+                last_snapshot = self.resource_manager.snapshot()
+                allowed = self.resource_manager.allowed_concurrency(
+                    len(running),
+                    len(pending),
+                    "process_scheduler",
+                    snapshot=last_snapshot,
                 )
-                if self.resource_manager is not None
-                else self.parallel_trials
-            )
+                eligible_devices = (
+                    set(
+                        self.resource_manager.available_gpu_devices(
+                            last_snapshot
+                        )
+                    )
+                    & set(free_devices)
+                    if requires_device
+                    else set()
+                )
+                if requires_device:
+                    allowed = min(
+                        allowed,
+                        len(running) + len(eligible_devices),
+                    )
+            else:
+                allowed = self.parallel_trials
+                eligible_devices = set(free_devices)
+            last_allowed = allowed
+            last_eligible_devices = set(eligible_devices)
             submitted = False
             while pending and len(running) < allowed:
-                device = take_device()
+                device = take_device(eligible_devices)
                 if requires_device and device is None:
                     break
+                if device is not None:
+                    eligible_devices.discard(device)
                 index, subset = pending.popleft()
                 attempts[index] += 1
                 channel = context.Queue()
@@ -3803,7 +3866,12 @@ class InteractionAwareSearch:
                 if time.monotonic() - last_progress >= wait_timeout:
                     raise RuntimeError(
                         "Resource wait timeout: no safe isolated-worker slot "
-                        "became available"
+                        "became available; "
+                        + resource_wait_details(
+                            last_snapshot,
+                            last_allowed,
+                            last_eligible_devices,
+                        )
                     )
                 time.sleep(min(interval, 0.25))
                 continue
@@ -5491,17 +5559,19 @@ def run_preflight(config_path: str | Path) -> dict[str, Any]:
             "seeds": 3 if fidelity == "confirm" else 1,
             "dense_matrix_upper_bound_gb": dense_gb,
         }
+    baseline_feature_budget = min(feature_count, cfg.search.max_features)
     baseline_dense_gb = (
         (train_rows + valid_rows)
-        * feature_count
+        * baseline_feature_budget
         * 8
         / float(1024**3)
     )
     warnings = []
     if feature_count > cfg.search.max_features:
         warnings.append(
-            "The all-feature baseline exceeds max_features and may require "
-            "substantially more memory than a search trial"
+            "The reference baseline and initial interaction model are capped "
+            "at search.max_features; the complete feature universe remains "
+            "available to random-subspace and evolutionary search"
         )
     if (
         cfg.execution.backend == "local"
@@ -5554,7 +5624,8 @@ def run_preflight(config_path: str | Path) -> dict[str, Any]:
         "inventories": inventories,
         "workloads": workloads,
         "baseline": {
-            "features": feature_count,
+            "features": baseline_feature_budget,
+            "input_features": feature_count,
             "dense_matrix_upper_bound_gb": baseline_dense_gb,
         },
         "execution": {
@@ -5801,26 +5872,39 @@ def run_pipeline(config_path: str | Path) -> None:
             cfg, fidelities, cache, resource_manager=resource_manager
         )
 
-    _event("baseline_started", n_features=len(features))
+    # A full-input baseline is not a valid candidate when the final model is
+    # capped by search.max_features. Reuse the calibrated, bounded reference
+    # subset instead: it is representative of a real search trial and avoids
+    # an unnecessary 1000+ feature GPU fit before the actual search starts.
+    reference_features = _bounded_reference_features(
+        features,
+        calibration_subset,
+        cfg.search.max_features,
+    )
+    _event(
+        "baseline_started",
+        n_features=len(reference_features),
+        input_features=len(features),
+    )
     if resource_manager is not None:
         resource_manager.wait_for_single_trial("baseline_wait")
     if isolate_local:
         baseline_runner = new_search()
         baseline = baseline_runner._evaluate_many_raw(
-            [frozenset(features)], "search"
+            [frozenset(reference_features)], "search"
         )[0]
     else:
-        baseline = evaluator.evaluate(features, "search")
+        baseline = evaluator.evaluate(reference_features, "search")
     _event("baseline_completed", valid_metric=baseline.valid_metric)
     interaction_cache = evaluator._interaction_cache_path(
-        features, "search", cfg.search.interaction_pairs
+        reference_features, "search", cfg.search.interaction_pairs
     )
     if isolate_local and not interaction_cache.exists():
         interaction_result = run_isolated_catboost_action(
             evaluator,
             resource_manager,
             "interaction_pairs",
-            features,
+            reference_features,
             "search",
             interaction_limit=cfg.search.interaction_pairs,
         )
@@ -5830,7 +5914,7 @@ def run_pipeline(config_path: str | Path) -> None:
         ]
     else:
         interactions = evaluator.interaction_pairs(
-            features, "search", cfg.search.interaction_pairs
+            reference_features, "search", cfg.search.interaction_pairs
         )
     _event("interactions_discovered", pairs=len(interactions))
     search = new_search(interactions, checkpoint=True)

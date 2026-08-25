@@ -1,0 +1,14 @@
+catboost>=1.2.8,<2
+numpy>=1.26,<2.3
+polars>=1.30,<2
+pyarrow>=16,<24
+PyYAML>=6,<7
+scikit-learn>=1.5,<2
+psutil>=5.9,<8
+
+# Optional, preferred for low-overhead per-GPU telemetry. If absent, the
+# selector falls back to nvidia-smi when it is available.
+# nvidia-ml-py>=12,<14
+
+# Optional multi-host backend:
+# ray[default]>=2.40,<3

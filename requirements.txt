@@ -1,0 +1,22 @@
+# Python 3.10+
+# Общие зависимости для:
+# - prepare_selector_samples.py
+# - interaction_subset_selector.py / run_interaction_selector.py
+# - run_stability_selection.py
+
+catboost>=1.2.8,<2
+numpy>=1.26,<3
+polars>=1.30,<2
+pyarrow>=16,<24
+scikit-learn>=1.5,<2
+PyYAML>=6.0,<7
+
+# Мониторинг и безопасное распределение локальных ресурсов.
+psutil>=5.9,<8
+nvidia-ml-py>=12,<14
+
+# Нужен run_interaction_selector.py, если используется CAT_FEATURES_PATH.
+joblib>=1.3,<2
+
+# Для execution.backend: ray установите дополнительно:
+# ray[default]>=2.40,<3

@@ -1,0 +1,44 @@
+# Existing wrapper selector entry point and its full YAML template.
+selector_script: /path/to/interaction_subset_selector.py
+selector_template_config: /path/to/config.interaction-selector.example.yaml
+
+# Produced by prepare_selector_samples.py.
+selector_data_config: ./split_parts/selector_data.yaml
+folds_manifest: ./split_parts/folds_manifest.json
+
+output_directory: ./stability_selection
+resume: true
+
+# Run the final selector on base train/valid and configured OOS/OOT/test after
+# fold aggregation.
+# Keep false for the first inspection of stability_report.json.
+run_final: false
+
+# With 3 folds, 0.34 means that a factor must win in at least 2 folds.
+candidate_min_frequency: 0.34
+# Stable core is reported separately; it is not forced unless configured below.
+# With exactly 3 folds, 0.67 requires presence in all 3 folds.
+core_min_frequency: 0.67
+pair_min_frequency: 0.34
+max_candidate_features: 300
+max_reported_pairs: 500
+
+# Restrict the final wrapper universe to the stable candidate pool. Original
+# required_features and always_keep_features are retained regardless of frequency.
+restrict_final_universe: true
+force_stable_core: false
+always_keep_features: []
+
+# Optional reductions of fold-run cost. Contract sections data, validation,
+# robust_validation, decision_threshold and output are owned by the runner and
+# cannot be overridden here. OOS/OOT/test are always absent from fold runs.
+fold_overrides:
+  search:
+    random_subspaces: 30
+    adaptive_subspaces: 20
+    population_size: 24
+    generations: 8
+    restarts: 1
+
+# Optional overrides for the final full run. data/output remain runner-owned.
+final_overrides: {}

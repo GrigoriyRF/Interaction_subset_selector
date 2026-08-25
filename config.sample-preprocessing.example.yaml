@@ -1,0 +1,73 @@
+input:
+  # Already model-ready data. No cleaning, imputation, casting, deduplication,
+  # or automatic factor removal is performed here.
+  # A Parquet file, glob, or directory. CSV is supported via format: csv.
+  path: /path/to/modeling_population
+  format: parquet
+  target: target
+  positive_label: 1
+
+  # These columns are preserved in every output sample. The downstream selector
+  # requires at least one deterministic sampling key.
+  id_columns: [application_id, customer_id]
+  sampling_key_columns: [application_id]
+  leakage_key_columns: [customer_id]
+  bootstrap_key_columns: [customer_id]
+
+  # Leave empty to infer String/Categorical/Enum feature columns from the schema.
+  categorical_features: []
+  excluded_features: []
+  required_features: []
+
+split:
+  # auto chooses group_temporal when both time and group keys are present,
+  # temporal with time only, group with group only, otherwise stratified.
+  mode: auto
+  train_fraction: 0.55
+  valid_fraction: 0.15
+  oos_fraction: 0.15
+  oot_fraction: 0.15
+  # Optional second final holdout. Reduce another fraction when it is positive.
+  test_fraction: 0.0
+  seed: 42
+  time_column: event_date
+
+  # Empty means: use input.leakage_key_columns. Explicit group columns are also
+  # added to leakage_key_columns in the generated selector config, so they
+  # cannot accidentally become model factors.
+  group_columns: []
+
+  # For group_temporal: OOT/test are final chronological periods. Earlier rows
+  # belonging to their groups are purged from development history. If both are
+  # present, test is the latest period and its groups are also removed from OOT.
+  purge_final_holdout_groups_from_history: true
+  # If false, rows with a missing time are conservatively assigned to history
+  # (the first temporal window), never to OOT.
+  fail_on_null_time: true
+  fail_on_null_group: true
+
+output:
+  directory: ./split_parts
+  overwrite: false
+  compression: zstd
+
+validation:
+  # Required by the uploaded interaction selector.
+  require_binary_target_in_every_split: true
+  check_group_overlap: true
+
+folds:
+  # Inner folds are built only from base train + valid. OOS/OOT/test are never
+  # included. Set false when only the ordinary one-shot selector run is needed.
+  enabled: true
+  # auto: group_temporal / temporal / group / stratified according to split mode.
+  strategy: auto
+  n_folds: 3
+  # Repeats are supported for random/stratified/group folds. Temporal folds use 1.
+  repeats: 1
+  seed_stride: 10000
+  # For expanding temporal folds, the earliest 50% of development history is
+  # the minimum initial training window.
+  temporal_min_train_fraction: 0.50
+  # Fail early when a fold is too small for meaningful wrapper evaluation.
+  min_positive_rows: 20

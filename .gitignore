@@ -3,6 +3,16 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+*.pyc
+.ipynb_checkpoints /
+
+split_parts/
+interaction_selection_results*/
+stability_selection/
+
+config.run.yaml
+preflight_plan.json
+
 # C extensions
 *.so
 

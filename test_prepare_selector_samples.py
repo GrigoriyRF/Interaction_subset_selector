@@ -39,6 +39,32 @@ def config(**split_overrides):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_categorical_null_policy_is_forwarded_to_selector_data(self):
+        cfg = Config(
+            input=InputConfig(
+                path="/data/source",
+                target="target",
+                sampling_key_columns=["row_id"],
+                categorical_null_strategy="fill",
+                categorical_null_value="__NA__",
+            )
+        )
+        cfg.validate()
+        with tempfile.TemporaryDirectory() as directory:
+            builder = SampleBuilder.__new__(SampleBuilder)
+            builder.cfg = cfg
+            builder.root = Path(directory)
+            builder.schema = {"target": "Int64", "row_id": "Int64"}
+            output = builder._write_selector_config(
+                {"train": "/splits/train", "valid": "/splits/valid"}
+            )
+            import yaml
+
+            selector_data = yaml.safe_load(output.read_text(encoding="utf-8"))["data"]
+
+        self.assertEqual(selector_data["categorical_null_strategy"], "fill")
+        self.assertEqual(selector_data["categorical_null_value"], "__NA__")
+
     def test_auto_without_time_uses_group_from_leakage_keys(self):
         cfg = config()
         self.assertEqual(cfg.group_columns, ["customer_id"])

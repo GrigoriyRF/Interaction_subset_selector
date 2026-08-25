@@ -15,6 +15,7 @@ import numpy as np
 
 from interaction_subset_selector import (
     AppConfig,
+    CatBoostSubsetEvaluator,
     CoalitionScore,
     DecisionThresholdConfig,
     DeterministicEvaluator,
@@ -43,6 +44,55 @@ from interaction_subset_selector import (
 
 
 class InteractionSelectorTests(unittest.TestCase):
+    def test_categorical_null_contract(self):
+        cfg = AppConfig.from_dict(
+            {
+                "data": {
+                    "train_path": "/data/train",
+                    "valid_path": "/data/valid",
+                    "target": "target",
+                    "sampling_key_columns": ["row_id"],
+                    "categorical_null_strategy": "fill",
+                    "categorical_null_value": "__NA__",
+                }
+            }
+        )
+        cfg.validate()
+        self.assertEqual(cfg.data.categorical_null_value, "__NA__")
+        cfg.data.categorical_null_strategy = "unknown"
+        with self.assertRaisesRegex(ValueError, "categorical_null_strategy"):
+            cfg.validate()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("polars") is not None,
+        "Polars is required for categorical-null model-frame handling",
+    )
+    def test_categorical_nulls_are_filled_only_in_model_frame(self):
+        import polars as pl
+
+        cfg = AppConfig.from_dict(
+            {
+                "data": {
+                    "train_path": "/data/train",
+                    "valid_path": "/data/valid",
+                    "target": "target",
+                    "sampling_key_columns": ["row_id"],
+                    "categorical_features": ["category"],
+                    "categorical_null_strategy": "fill",
+                    "categorical_null_value": "__NA__",
+                }
+            }
+        )
+        evaluator = object.__new__(CatBoostSubsetEvaluator)
+        evaluator.cfg = cfg
+        source = pl.DataFrame(
+            {"category": ["A", None], "numeric": [1.0, None]}
+        )
+        model = evaluator._model_frame(source, ["category", "numeric"])
+        self.assertEqual(model["category"].to_list(), ["A", "__NA__"])
+        self.assertEqual(model["numeric"].null_count(), 1)
+        self.assertEqual(source["category"].null_count(), 1)
+
     def test_optional_split_roles_select_validation_mode(self):
         base_data = {
             "train_path": "/data/train",

@@ -1,4 +1,6 @@
 # Existing wrapper selector entry point and its full YAML template.
+# The template also owns data.categorical_null_strategy/value, so fold and
+# final runs use exactly the same categorical-null policy.
 selector_script: /path/to/interaction_subset_selector.py
 selector_template_config: /path/to/config.interaction-selector.example.yaml
 

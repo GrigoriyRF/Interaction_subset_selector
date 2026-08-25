@@ -18,8 +18,15 @@ data:
   sampling_key_columns:
     - application_id
 
-  # CatBoost-ready categorical columns. This selector does not cast or fill them.
+  # CatBoost-ready categorical columns. No source Parquet is rewritten.
   categorical_features: []
+
+  # CatBoost's Arrow adapter rejects null values in categorical columns.
+  # "fill" replaces them only in the in-memory model matrix; source Parquet
+  # files and saved selector samples remain unchanged. Use "error" for strict
+  # fail-fast behavior instead.
+  categorical_null_strategy: fill  # fill or error
+  categorical_null_value: "__MISSING__"
 
   # Explicit protection against target leakage and unavailable production data.
   excluded_features: []

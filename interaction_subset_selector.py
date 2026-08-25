@@ -26,7 +26,7 @@ from typing import Any, Iterable, Protocol, Sequence
 
 
 INTERNAL_WEIGHT = "__selection_weight__"
-APP_VERSION = "0.10.1"
+APP_VERSION = "0.10.2"
 _STARTED_AT = time.monotonic()
 _EVENT_OUTPUT_ENABLED = True
 
@@ -135,6 +135,8 @@ class DataConfig:
     id_columns: list[str] = field(default_factory=list)
     sampling_key_columns: list[str] = field(default_factory=list)
     categorical_features: list[str] = field(default_factory=list)
+    categorical_null_strategy: str = "fill"
+    categorical_null_value: str = "__MISSING__"
     excluded_features: list[str] = field(default_factory=list)
     required_features: list[str] = field(default_factory=list)
     leakage_key_columns: list[str] = field(default_factory=list)
@@ -405,6 +407,18 @@ class AppConfig:
             raise ValueError("All sampling fractions must be in (0, 1]")
         if not self.data.sampling_key_columns:
             raise ValueError("sampling_key_columns are required for deterministic large-data sampling")
+        if self.data.categorical_null_strategy not in {"fill", "error"}:
+            raise ValueError(
+                "data.categorical_null_strategy must be 'fill' or 'error'"
+            )
+        if (
+            self.data.categorical_null_strategy == "fill"
+            and not self.data.categorical_null_value
+        ):
+            raise ValueError(
+                "data.categorical_null_value must be a non-empty string "
+                "when categorical_null_strategy='fill'"
+            )
         if self.search.min_features < 1:
             raise ValueError("min_features must be positive")
         if self.search.max_features < self.search.min_features:
@@ -2289,7 +2303,41 @@ class CatBoostSubsetEvaluator:
         y = frame[self.cfg.data.target].to_numpy()
         y = (y == self.cfg.data.positive_label).astype("int8")
         weight = frame[INTERNAL_WEIGHT].to_numpy()
-        return frame.select(list(subset)), y, weight
+        return self._model_frame(frame, subset), y, weight
+
+    def _model_frame(self, frame: Any, subset: Sequence[str]) -> Any:
+        """Prepare CatBoost categorical values without mutating source Parquet."""
+        pl = _require("polars", "polars>=1.30")
+        categorical = [
+            feature
+            for feature in subset
+            if feature in self.cfg.data.categorical_features
+        ]
+        if not categorical:
+            return frame.select(list(subset))
+        if self.cfg.data.categorical_null_strategy == "error":
+            nulls = {
+                feature: int(frame[feature].null_count())
+                for feature in categorical
+                if frame[feature].null_count()
+            }
+            if nulls:
+                raise ValueError(
+                    "Categorical features contain null values: "
+                    f"{nulls}. Use data.categorical_null_strategy='fill' "
+                    "or prepare the source data upstream."
+                )
+            return frame.select(list(subset))
+        replacement = self.cfg.data.categorical_null_value
+        return frame.with_columns(
+            [
+                pl.col(feature)
+                .cast(pl.String)
+                .fill_null(replacement)
+                .alias(feature)
+                for feature in categorical
+            ]
+        ).select(list(subset))
 
     def _load_holdout(
         self, path: str, subset: Sequence[str]
@@ -2314,7 +2362,7 @@ class CatBoostSubsetEvaluator:
                 pl.struct(group_columns).hash(seed=71).alias(group_name)
             )
             groups = frame[group_name].to_numpy()
-        return frame.select(list(subset)), y, weight, groups
+        return self._model_frame(frame, subset), y, weight, groups
 
     def _params(
         self,

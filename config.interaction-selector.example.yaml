@@ -215,13 +215,13 @@ resources:
   gpu_total_memory_gb: null
   gpu_memory_by_device_gb: {}
   reserve_gpu_memory_gb: 2.0
-  max_gpu_memory_utilization: 0.85
+  max_gpu_memory_utilization: 0.90
 
   adaptive_concurrency: true
   monitoring_interval_seconds: 1.0
   resource_wait_timeout_seconds: 300.0
   calibration_enabled: true
-  calibration_safety_factor: 1.30
+  calibration_safety_factor: 1.20
   # Optional conservative overrides; null means measure one representative fit.
   estimated_ram_per_trial_gb: null
   estimated_gpu_memory_per_trial_gb: null
@@ -236,6 +236,9 @@ resources:
 
 model_params:
   task_type: GPU
+  # CatBoost defaults to 0.95 and can reserve almost the entire card even when
+  # the model needs less. Keep headroom for the worker and resource monitor.
+  gpu_ram_part: 0.70
   # Match early stopping to the primary objective above.
   eval_metric: "PRAUC:type=Classic;use_weights=true"
   learning_rate: 0.05

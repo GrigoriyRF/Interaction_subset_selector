@@ -65,6 +65,10 @@ CPU_CORES: int | None = None
 RAM_GB: float | None = None
 GPU_MEMORY_BY_DEVICE_GB: dict[str, float] = {}
 GPU_DEVICES: list[str] = []  # [] = все подходящие карты; пример: ["0", "1"]
+GPU_RAM_PART = 0.70
+GPU_RESERVE_MEMORY_GB = 2.0
+GPU_MAX_MEMORY_UTILIZATION = 0.90
+CALIBRATION_SAFETY_FACTOR = 1.20
 
 TEMPLATE_CONFIG = Path(__file__).with_name(
     "config.interaction-selector.example.yaml"
@@ -194,11 +198,15 @@ def build_config() -> dict[str, Any]:
             "gpu_count": None,
             "gpu_total_memory_gb": None,
             "gpu_memory_by_device_gb": GPU_MEMORY_BY_DEVICE_GB,
+            "reserve_gpu_memory_gb": GPU_RESERVE_MEMORY_GB,
+            "max_gpu_memory_utilization": GPU_MAX_MEMORY_UTILIZATION,
+            "calibration_safety_factor": CALIBRATION_SAFETY_FACTOR,
         }
     )
     config["model_params"].update(
         {
             "task_type": "GPU",
+            "gpu_ram_part": GPU_RAM_PART,
             "eval_metric": "PRAUC:type=Classic;use_weights=true",
             "learning_rate": 0.08844,
             "depth": 8,

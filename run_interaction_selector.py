@@ -44,6 +44,11 @@ FORCED_CATEGORICAL_FEATURES = [
     "cust_cred_max_ovr_bucket_fifo_3m_code",
 ]
 
+# CatBoost rejects Arrow nulls in categorical columns. Filling happens only in
+# the in-memory model matrix; input and sampled Parquet files are not rewritten.
+CATEGORICAL_NULL_STRATEGY = "fill"  # fill or error
+CATEGORICAL_NULL_VALUE = "__MISSING__"
+
 EXCLUDED_FEATURES: list[str] = []
 REQUIRED_FEATURES: list[str] = []
 
@@ -133,6 +138,8 @@ def build_config() -> dict[str, Any]:
             "id_columns": ID_COLUMNS,
             "sampling_key_columns": SAMPLING_KEY_COLUMNS,
             "categorical_features": load_categorical_features(train_schema),
+            "categorical_null_strategy": CATEGORICAL_NULL_STRATEGY,
+            "categorical_null_value": CATEGORICAL_NULL_VALUE,
             "excluded_features": EXCLUDED_FEATURES,
             "required_features": REQUIRED_FEATURES,
             "leakage_key_columns": LEAKAGE_KEY_COLUMNS,

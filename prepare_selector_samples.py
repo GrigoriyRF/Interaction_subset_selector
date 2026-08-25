@@ -41,6 +41,8 @@ class InputConfig:
     leakage_key_columns: list[str] = field(default_factory=list)
     bootstrap_key_columns: list[str] = field(default_factory=list)
     categorical_features: list[str] = field(default_factory=list)
+    categorical_null_strategy: str = "fill"
+    categorical_null_value: str = "__MISSING__"
     excluded_features: list[str] = field(default_factory=list)
     required_features: list[str] = field(default_factory=list)
     csv_options: dict[str, Any] = field(default_factory=dict)
@@ -144,6 +146,18 @@ class Config:
         if not self.input.sampling_key_columns:
             raise ValueError(
                 "input.sampling_key_columns is required by the downstream selector"
+            )
+        if self.input.categorical_null_strategy not in {"fill", "error"}:
+            raise ValueError(
+                "input.categorical_null_strategy must be 'fill' or 'error'"
+            )
+        if (
+            self.input.categorical_null_strategy == "fill"
+            and not self.input.categorical_null_value
+        ):
+            raise ValueError(
+                "input.categorical_null_value must be a non-empty string "
+                "when categorical_null_strategy='fill'"
             )
         fractions = self.fractions()
         if any(value < 0 or value >= 1 for value in fractions.values()):
@@ -828,6 +842,10 @@ class SampleBuilder:
                 "id_columns": self.cfg.input.id_columns,
                 "sampling_key_columns": self.cfg.input.sampling_key_columns,
                 "categorical_features": self._categorical_features(),
+                "categorical_null_strategy": (
+                    self.cfg.input.categorical_null_strategy
+                ),
+                "categorical_null_value": self.cfg.input.categorical_null_value,
                 "excluded_features": self.cfg.input.excluded_features,
                 "required_features": self.cfg.input.required_features,
                 "leakage_key_columns": self.cfg.downstream_leakage_keys,

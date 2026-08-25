@@ -15,7 +15,11 @@ input:
   bootstrap_key_columns: [customer_id]
 
   # Leave empty to infer String/Categorical/Enum feature columns from the schema.
+  # Nulls are preserved in split Parquet files. The downstream selector applies
+  # its configured categorical_null_strategy only in the CatBoost model matrix.
   categorical_features: []
+  categorical_null_strategy: fill  # fill or error
+  categorical_null_value: "__MISSING__"
   excluded_features: []
   required_features: []
 

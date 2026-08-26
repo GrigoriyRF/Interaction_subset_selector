@@ -1,0 +1,265 @@
+data:
+  train_path: /path/to/splits/train
+  valid_path: /path/to/splits/valid
+  # Optional roles. Use null when a split is unavailable.
+  oos_path: /path/to/splits/oos
+  oot_path: /path/to/splits/oot
+  test_path: null
+  target: target
+  positive_label: 1
+
+  # These columns are never considered model features.
+  id_columns:
+    - application_id
+    - customer_id
+    - application_date
+
+  # Required for reproducible hash sampling. Prefer a row-unique stable key.
+  sampling_key_columns:
+    - application_id
+
+  # CatBoost-ready categorical columns. No source Parquet is rewritten.
+  categorical_features: []
+
+  # CatBoost's Arrow adapter rejects null values in categorical columns.
+  # "fill" replaces them only in the in-memory model matrix; source Parquet
+  # files and saved selector samples remain unchanged. Use "error" for strict
+  # fail-fast behavior instead.
+  categorical_null_strategy: fill  # fill or error
+  categorical_null_value: "__MISSING__"
+
+  # Explicit protection against target leakage and unavailable production data.
+  excluded_features: []
+  required_features: []
+
+  # Optional group leakage check between train and valid.
+  leakage_key_columns:
+    - customer_id
+
+  # Resample whole entities instead of rows during OOS/OOT bootstrap.
+  # Use the production entity whose repeated observations are dependent.
+  bootstrap_key_columns:
+    - customer_id
+
+sample:
+  # Cheapest successive-halving level.
+  screen_train_positive_fraction: 1.0
+  screen_train_negative_fraction: 0.05
+  screen_valid_positive_fraction: 1.0
+  screen_valid_negative_fraction: 0.10
+
+  # The training sample may be prevalence-corrected with inverse-probability weights.
+  train_positive_fraction: 1.0
+  train_negative_fraction: 0.15
+  valid_positive_fraction: 1.0
+  valid_negative_fraction: 0.30
+
+  # Larger samples for confirmation of Pareto finalists.
+  confirm_train_positive_fraction: 1.0
+  confirm_train_negative_fraction: 0.50
+  confirm_valid_positive_fraction: 1.0
+  confirm_valid_negative_fraction: 1.0
+
+  # Independent holdouts. Reduce negative fractions only when full scoring is too large.
+  oos_positive_fraction: 1.0
+  oos_negative_fraction: 1.0
+  oot_positive_fraction: 1.0
+  oot_negative_fraction: 1.0
+  test_positive_fraction: 1.0
+  test_negative_fraction: 1.0
+  seed: 42
+
+validation:
+  # Validation never changes, cleans, imputes, or drops input features.
+  check_split_schema: true
+  check_id_overlap: false
+  fail_on_id_overlap: true
+
+search:
+  # Supported: average_precision, roc_auc, gini, logloss, brier.
+  primary_metric: average_precision
+  min_features: 10
+  # Final subset cap. Search may temporarily explore larger subsets.
+  max_features: 100
+  search_max_features: 150
+
+  # Minipatch/random-subspace exploration.
+  random_subspaces: 60
+  adaptive_subspaces: 40
+  subspace_min_features: 20
+  subspace_max_features: 150
+  elite_fraction: 0.20
+
+  # Multi-objective evolutionary search.
+  population_size: 36
+  generations: 15
+  mutation_rate: 0.75
+  crossover_rate: 0.80
+  interaction_pairs: 100
+  interaction_mutation_probability: 0.35
+
+  # Coalition-aware learning from successful complete subsets.
+  coalition_top_pairs: 200
+  coalition_top_triples: 40
+  coalition_min_support: 2
+  coalition_smoothing: 2.0
+  coalition_pairs_per_subset: 2000
+  coalition_triples_per_subset: 200
+  coalition_sampling_probability: 0.45
+  coalition_mutation_probability: 0.35
+  coalition_preservation_probability: 0.65
+  coalition_refresh_interval: 3
+  coalition_history_limit: 300
+  interaction_prior_weight: 0.50
+
+  # Floating add/drop refinement.
+  local_candidates: 5
+  local_rounds: 2
+
+  # Constraints and final compact-set decision rule.
+  # Optional gap of the selected primary metric. null disables this gate.
+  max_primary_metric_gap: null
+  # Independent train/valid Gini gap gate.
+  max_gini_gap: 0.15
+  allowed_metric_drop: 0.002
+
+  # Train every proposal cheaply, then promote only a Pareto-diverse fraction.
+  successive_halving_enabled: true
+  promotion_fraction: 0.35
+  min_promoted: 4
+  # Adaptive mode spends more search budget when the screen result is ambiguous.
+  promotion_strategy: adaptive  # fixed or adaptive
+  promotion_min_fraction: 0.20
+  promotion_max_fraction: 0.60
+  promotion_metric_band: 0.005
+
+  restarts: 2
+  seed: 42
+
+robust_validation:
+  enabled: true
+  require_oos: true
+
+  # OOS chooses the finalist; OOT is evaluated only after that choice.
+  evaluate_oot: true
+  # An optional test split is also evaluated only after selection.
+  evaluate_test: true
+
+  # Paired stratified bootstrap on row-aligned predictions. "auto" uses whole
+  # entities when bootstrap_key_columns is set, otherwise individual rows.
+  bootstrap_repeats: 500
+  confidence_level: 0.95
+  bootstrap_max_rows: 50000
+  bootstrap_seed: 2026
+  bootstrap_mode: auto
+
+  # null means: reuse search.allowed_metric_drop as the non-inferiority margin.
+  noninferiority_margin: null
+
+decision_threshold:
+  enabled: true
+  # The threshold is chosen on confirm_valid, tested on OOS, and then frozen.
+  min_recall: 0.50
+  min_precision: 0.20
+  objective: max_precision  # max_precision or max_f1
+  # report: diagnostic only; filter: prefer feasible; strict: fail if none.
+  oos_policy: report
+  # Optional early feasibility gate. Keep false for a task-agnostic selector.
+  enforce_during_search: false
+  enforce_fidelities: [search, confirm]
+
+execution:
+  # local uses isolated processes (or opt-in threads) on one host; ray uses a
+  # local or multi-node Ray cluster.
+  backend: local
+  # process isolates every CatBoost fit from the notebook kernel. thread is
+  # faster to start but cannot survive a process-level OOM.
+  local_trial_mode: process
+  # forkserver is faster on Linux; use spawn when forkserver is unavailable.
+  process_start_method: forkserver
+  # 0 lets the resource manager choose the safe number of simultaneous fits.
+  # A positive value is a hard upper bound, not a demand to start that many.
+  parallel_trials: 0
+  # 0 also lets the resource manager divide the usable CPU budget per trial.
+  threads_per_trial: 0
+  # Empty means every detected GPU that passes the per-card memory checks.
+  gpu_devices: []
+  trial_max_retries: 1
+  trial_failure_policy: continue  # continue or fail_fast
+  minimum_successful_fraction: 0.75
+  retry_backoff_seconds: 0.0
+  trial_timeout_seconds: 3600.0
+  heartbeat_interval_seconds: 2.0
+  heartbeat_timeout_seconds: 30.0
+  terminate_grace_seconds: 5.0
+  show_progress: true
+  progress_interval_seconds: 10.0
+
+  # Used only by backend: ray. All nodes must see data and cache paths.
+  ray_address: null  # null starts local Ray; "auto" connects to a cluster
+  ray_namespace: interaction-selector
+  ray_num_cpus_per_trial: 1.0
+  ray_num_gpus_per_trial: 0.0
+  ray_runtime_env: {}
+  checkpoint_enabled: true
+  resume_search: true
+
+resources:
+  enabled: true
+  # auto = detected limits; manual = supplied limits; hybrid = the smaller of
+  # detected and supplied values. Hybrid is safest for shared kernels/jobs.
+  mode: hybrid
+  cpu_cores: null
+  reserve_cpu_cores: 2
+  max_cpu_utilization: 0.85
+  ram_gb: null
+  reserve_ram_gb: 4.0
+  max_ram_utilization: 0.80
+
+  # Prefer per-card values for heterogeneous GPUs. If only count and aggregate
+  # memory are supplied, the aggregate is divided evenly; memory is never pooled
+  # across cards because one model must fit on one physical GPU.
+  gpu_count: null
+  gpu_total_memory_gb: null
+  gpu_memory_by_device_gb: {}
+  reserve_gpu_memory_gb: 2.0
+  max_gpu_memory_utilization: 0.90
+
+  adaptive_concurrency: true
+  monitoring_interval_seconds: 1.0
+  resource_wait_timeout_seconds: 300.0
+  calibration_enabled: true
+  calibration_safety_factor: 1.20
+  # Optional conservative overrides; null means measure one representative fit.
+  estimated_ram_per_trial_gb: null
+  estimated_gpu_memory_per_trial_gb: null
+  # Optional absolute worker limits. null derives them from calibration and
+  # hard_limit_multiplier. Limits apply to one isolated process/card.
+  hard_ram_per_trial_gb: null
+  hard_gpu_memory_per_trial_gb: null
+  hard_limit_multiplier: 2.0
+  profile_learning_enabled: true
+  # After an OOM, halve the current in-flight limit before retrying.
+  oom_concurrency_reduction: 0.50
+
+model_params:
+  task_type: GPU
+  # CatBoost defaults to 0.95 and can reserve almost the entire card even when
+  # the model needs less. Keep headroom for the worker and resource monitor.
+  gpu_ram_part: 0.70
+  # eval_metric is owned by the selector. On GPU it uses Logloss only for
+  # early stopping; the configured primary_metric is still computed from
+  # predict_proba and drives subset ranking.
+  learning_rate: 0.05
+  depth: 7
+  l2_leaf_reg: 10.0
+  random_strength: 1.0
+  screen_iterations: 120
+  search_iterations: 350
+  confirm_iterations: 1000
+
+output:
+  directory: interaction_selection_results
+  cache_directory: interaction_selection_results/cache
+  # Stores only robust-validation holdout predictions for resume/reuse.
+  save_trial_predictions: true

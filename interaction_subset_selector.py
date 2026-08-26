@@ -26,7 +26,7 @@ from typing import Any, Iterable, Protocol, Sequence
 
 
 INTERNAL_WEIGHT = "__selection_weight__"
-APP_VERSION = "0.10.4"
+APP_VERSION = "0.11.0"
 _STARTED_AT = time.monotonic()
 _EVENT_OUTPUT_ENABLED = True
 
@@ -187,6 +187,7 @@ class SearchConfig:
     primary_metric: str = "average_precision"
     min_features: int = 10
     max_features: int = 100
+    search_max_features: int | None = None
     random_subspaces: int = 60
     adaptive_subspaces: int = 40
     subspace_min_features: int = 20
@@ -212,7 +213,10 @@ class SearchConfig:
     interaction_prior_weight: float = 0.50
     local_candidates: int = 5
     local_rounds: int = 2
-    max_gap: float = 0.15
+    max_primary_metric_gap: float | None = None
+    max_gini_gap: float = 0.15
+    # Backward-compatible alias for older configs; maps to primary-metric gap.
+    max_gap: float | None = None
     allowed_metric_drop: float = 0.002
     successive_halving_enabled: bool = False
     promotion_fraction: float = 0.35
@@ -253,6 +257,8 @@ class DecisionThresholdConfig:
     min_precision: float = 0.20
     objective: str = "max_precision"
     require_oos_feasible: bool = True
+    enforce_during_search: bool = True
+    enforce_fidelities: list[str] = field(default_factory=lambda: ["search", "confirm"])
 
 
 @dataclass(slots=True)
@@ -296,12 +302,12 @@ class ResourceConfig:
     gpu_total_memory_gb: float | None = None
     gpu_memory_by_device_gb: dict[str, float] = field(default_factory=dict)
     reserve_gpu_memory_gb: float = 2.0
-    max_gpu_memory_utilization: float = 0.90
+    max_gpu_memory_utilization: float = 0.85
     adaptive_concurrency: bool = True
     monitoring_interval_seconds: float = 1.0
     resource_wait_timeout_seconds: float = 300.0
     calibration_enabled: bool = True
-    calibration_safety_factor: float = 1.20
+    calibration_safety_factor: float = 1.30
     estimated_ram_per_trial_gb: float | None = None
     estimated_gpu_memory_per_trial_gb: float | None = None
     hard_ram_per_trial_gb: float | None = None
@@ -423,6 +429,10 @@ class AppConfig:
             raise ValueError("min_features must be positive")
         if self.search.max_features < self.search.min_features:
             raise ValueError("max_features must be >= min_features")
+        if self.search.search_max_features is None:
+            self.search.search_max_features = self.search.max_features
+        if self.search.search_max_features < self.search.max_features:
+            raise ValueError("search_max_features must be >= max_features")
         if not 0 < self.search.elite_fraction <= 1:
             raise ValueError("elite_fraction must be in (0, 1]")
         probabilities = {
@@ -439,8 +449,19 @@ class AppConfig:
             raise ValueError("population_size must be at least 2")
         if self.search.generations < 1 or self.search.restarts < 1:
             raise ValueError("generations and restarts must be positive")
-        if self.search.allowed_metric_drop < 0 or self.search.max_gap < 0:
-            raise ValueError("allowed_metric_drop and max_gap must be non-negative")
+        if self.search.allowed_metric_drop < 0:
+            raise ValueError("allowed_metric_drop must be non-negative")
+        if self.search.max_primary_metric_gap is None and self.search.max_gap is not None:
+            self.search.max_primary_metric_gap = self.search.max_gap
+        if (
+            self.search.max_primary_metric_gap is not None
+            and self.search.max_primary_metric_gap < 0
+        ):
+            raise ValueError("max_primary_metric_gap must be non-negative or null")
+        if self.search.max_gap is not None and self.search.max_gap < 0:
+            raise ValueError("max_gap must be non-negative or null")
+        if self.search.max_gini_gap < 0:
+            raise ValueError("max_gini_gap must be non-negative")
         if self.search.subspace_min_features < 1:
             raise ValueError("subspace_min_features must be positive")
         if self.search.subspace_max_features < self.search.subspace_min_features:
@@ -528,6 +549,12 @@ class AppConfig:
             raise ValueError("decision_threshold.min_precision must be in [0, 1]")
         if threshold.objective not in {"max_precision", "max_f1"}:
             raise ValueError("decision_threshold.objective must be max_precision or max_f1")
+        invalid_fidelities = set(threshold.enforce_fidelities) - {"screen", "search", "confirm"}
+        if invalid_fidelities:
+            raise ValueError(
+                "decision_threshold.enforce_fidelities contains unsupported values: "
+                f"{sorted(invalid_fidelities)}"
+            )
         execution = self.execution
         if execution.backend not in {"local", "ray"}:
             raise ValueError("execution.backend must be local or ray")
@@ -1369,20 +1396,10 @@ class ResourceManager:
         )
 
     def gpu_device_available(self, device: str) -> bool:
-        return str(device) in self.available_gpu_devices()
-
-    def available_gpu_devices(
-        self,
-        snapshot: ResourceSnapshot | None = None,
-    ) -> list[str]:
-        """Return selected GPUs that fit a trial in one coherent snapshot."""
-        current = snapshot if snapshot is not None else self.snapshot()
-        selected = set(self.execution.gpu_devices)
-        return [
-            item.device
-            for item in current.gpus
-            if item.device in selected and self._gpu_fits(item)
-        ]
+        return any(
+            item.device == str(device) and self._gpu_fits(item)
+            for item in self.snapshot().gpus
+        )
 
     def _ram_additional_slots(self, snapshot: ResourceSnapshot) -> int:
         used = snapshot.ram_total_gb - snapshot.ram_available_gb
@@ -1419,17 +1436,20 @@ class ResourceManager:
         active_trials: int,
         pending_trials: int,
         event: str = "scheduler",
-        snapshot: ResourceSnapshot | None = None,
     ) -> int:
         if not self.config.enabled:
             return self.current_parallel_limit
-        snapshot = snapshot if snapshot is not None else self.snapshot()
+        snapshot = self.snapshot()
         allowed = self.current_parallel_limit
         additional_ram = self._ram_additional_slots(snapshot)
         allowed = min(allowed, active_trials + additional_ram)
         if self.task_type == "GPU" and self.execution.backend == "local":
             selected = set(self.execution.gpu_devices)
-            additional_gpu = len(self.available_gpu_devices(snapshot))
+            additional_gpu = sum(
+                1
+                for item in snapshot.gpus
+                if item.device in selected and self._gpu_fits(item)
+            )
             allowed = min(
                 allowed,
                 len(selected),
@@ -1951,16 +1971,6 @@ def configured_split_paths(cfg: AppConfig) -> dict[str, str]:
     }
 
 
-def _bounded_reference_features(
-    features: Sequence[str],
-    calibration_subset: Sequence[str],
-    max_features: int,
-) -> list[str]:
-    if len(features) <= max_features:
-        return list(features)
-    return list(calibration_subset[:max_features])
-
-
 def validation_mode(cfg: AppConfig) -> str:
     has_oos = bool(cfg.data.oos_path)
     has_final_holdout = bool(cfg.data.oot_path or cfg.data.test_path)
@@ -2409,6 +2419,10 @@ class CatBoostSubsetEvaluator:
             "thread_count": -1,
         }
         params.update(self.cfg.model_params)
+        # primary_metric owns CatBoost early-stopping/eval metric. Keeping an
+        # independent model_params.eval_metric would make feature ranking and
+        # early stopping optimize different objectives.
+        params["eval_metric"] = eval_metric
         params["iterations"] = fidelity.iterations
         params["random_seed"] = seed
         if self.cfg.execution.threads_per_trial:
@@ -2456,6 +2470,9 @@ class CatBoostSubsetEvaluator:
         start = time.perf_counter()
         train_scores: list[float] = []
         valid_scores: list[float] = []
+        train_gini_scores: list[float] = []
+        valid_gini_scores: list[float] = []
+        valid_prediction_sum = np.zeros(len(y_valid), dtype="float64")
         metric_rows: list[dict[str, float]] = []
         with self._training_slot() as device:
             for seed in level.seeds:
@@ -2478,6 +2495,9 @@ class CatBoostSubsetEvaluator:
                 )
                 train_scores.append(train_primary)
                 valid_scores.append(valid_primary)
+                train_gini_scores.append(_metric_value("gini", y_train, pred_train, w_train))
+                valid_gini_scores.append(_metric_value("gini", y_valid, pred_valid, w_valid))
+                valid_prediction_sum += pred_valid
                 metric_rows.append(
                     {
                         "average_precision": _metric_value(
@@ -2501,10 +2521,55 @@ class CatBoostSubsetEvaluator:
         train_metric = float(np.mean(train_scores))
         valid_metric = float(np.mean(valid_scores))
         gap = max(0.0, train_metric - valid_metric)
-        violation = max(0.0, gap - self.cfg.search.max_gap)
+        train_gini = float(np.mean(train_gini_scores))
+        valid_gini = float(np.mean(valid_gini_scores))
+        gini_gap = abs(train_gini - valid_gini)
+        primary_gap_violation = (
+            max(0.0, gap - self.cfg.search.max_primary_metric_gap)
+            if self.cfg.search.max_primary_metric_gap is not None
+            else 0.0
+        )
+        gini_gap_violation = max(0.0, gini_gap - self.cfg.search.max_gini_gap)
         aggregate_metrics = {
             name: float(np.mean([row[name] for row in metric_rows])) for name in metric_rows[0]
         }
+        aggregate_metrics.update({
+            "train_gini": train_gini,
+            "valid_gini": valid_gini,
+            "gini_gap": gini_gap,
+        })
+        threshold_violation = 0.0
+        if (
+            self.cfg.decision_threshold.enabled
+            and self.cfg.decision_threshold.enforce_during_search
+            and fidelity in self.cfg.decision_threshold.enforce_fidelities
+        ):
+            averaged_valid_prediction = valid_prediction_sum / len(level.seeds)
+            threshold_result = select_decision_threshold(
+                selected,
+                SplitPredictions(
+                    split=level.valid_sample,
+                    y_true=y_valid,
+                    prediction=averaged_valid_prediction,
+                    weight=w_valid,
+                    seed_metrics=valid_scores,
+                ),
+                None,
+                self.cfg.decision_threshold,
+            )
+            aggregate_metrics.update({
+                "search_threshold": threshold_result.threshold,
+                "search_threshold_precision": threshold_result.tuning_precision,
+                "search_threshold_recall": threshold_result.tuning_recall,
+                "search_threshold_f1": threshold_result.tuning_f1,
+                "search_threshold_feasible": float(threshold_result.tuning_feasible),
+            })
+            if not threshold_result.tuning_feasible:
+                threshold_violation = (
+                    max(0.0, self.cfg.decision_threshold.min_precision - threshold_result.tuning_precision)
+                    + max(0.0, self.cfg.decision_threshold.min_recall - threshold_result.tuning_recall)
+                )
+        violation = primary_gap_violation + gini_gap_violation + threshold_violation
         evaluation = Evaluation(
             subset=selected,
             fidelity=fidelity,
@@ -2590,11 +2655,14 @@ class CatBoostSubsetEvaluator:
         holdout_seed_metrics: dict[str, list[float]] = {
             name: [] for name in holdouts
         }
-
         start = time.perf_counter()
         train_scores: list[float] = []
         valid_scores: list[float] = []
+        train_gini_scores: list[float] = []
+        valid_gini_scores: list[float] = []
+        valid_prediction_sum = np.zeros(len(y_valid), dtype="float64")
         metric_rows: list[dict[str, float]] = []
+
         with self._training_slot() as device:
             for seed in level.seeds:
                 model = catboost.CatBoostClassifier(
@@ -2618,6 +2686,9 @@ class CatBoostSubsetEvaluator:
                         self.primary_metric, y_valid, pred_valid, w_valid
                     )
                 )
+                train_gini_scores.append(_metric_value("gini", y_train, pred_train, w_train))
+                valid_gini_scores.append(_metric_value("gini", y_valid, pred_valid, w_valid))
+                valid_prediction_sum += pred_valid
                 metric_rows.append(
                     {
                         "average_precision": _metric_value(
@@ -2657,6 +2728,54 @@ class CatBoostSubsetEvaluator:
         train_metric = float(np.mean(train_scores))
         valid_metric = float(np.mean(valid_scores))
         gap = max(0.0, train_metric - valid_metric)
+        train_gini = float(np.mean(train_gini_scores))
+        valid_gini = float(np.mean(valid_gini_scores))
+        gini_gap = abs(train_gini - valid_gini)
+        primary_gap_violation = (
+            max(0.0, gap - self.cfg.search.max_primary_metric_gap)
+            if self.cfg.search.max_primary_metric_gap is not None
+            else 0.0
+        )
+        gini_gap_violation = max(0.0, gini_gap - self.cfg.search.max_gini_gap)
+        aggregate_metrics = {
+            name: float(np.mean([row[name] for row in metric_rows]))
+            for name in metric_rows[0]
+        }
+        aggregate_metrics.update({
+            "train_gini": train_gini,
+            "valid_gini": valid_gini,
+            "gini_gap": gini_gap,
+        })
+        threshold_violation = 0.0
+        if (
+            self.cfg.decision_threshold.enabled
+            and self.cfg.decision_threshold.enforce_during_search
+            and fidelity in self.cfg.decision_threshold.enforce_fidelities
+        ):
+            threshold_result = select_decision_threshold(
+                selected,
+                SplitPredictions(
+                    split=level.valid_sample,
+                    y_true=y_valid,
+                    prediction=valid_prediction_sum / len(level.seeds),
+                    weight=w_valid,
+                    seed_metrics=valid_scores,
+                ),
+                None,
+                self.cfg.decision_threshold,
+            )
+            aggregate_metrics.update({
+                "search_threshold": threshold_result.threshold,
+                "search_threshold_precision": threshold_result.tuning_precision,
+                "search_threshold_recall": threshold_result.tuning_recall,
+                "search_threshold_f1": threshold_result.tuning_f1,
+                "search_threshold_feasible": float(threshold_result.tuning_feasible),
+            })
+            if not threshold_result.tuning_feasible:
+                threshold_violation = (
+                    max(0.0, self.cfg.decision_threshold.min_precision - threshold_result.tuning_precision)
+                    + max(0.0, self.cfg.decision_threshold.min_recall - threshold_result.tuning_recall)
+                )
         evaluation = Evaluation(
             subset=selected,
             fidelity=fidelity,
@@ -2666,11 +2785,8 @@ class CatBoostSubsetEvaluator:
             metric_std=float(np.std(valid_scores)),
             n_features=len(selected),
             runtime_seconds=time.perf_counter() - start,
-            metrics={
-                name: float(np.mean([row[name] for row in metric_rows]))
-                for name in metric_rows[0]
-            },
-            constraint_violation=max(0.0, gap - self.cfg.search.max_gap),
+            metrics=aggregate_metrics,
+            constraint_violation=primary_gap_violation + gini_gap_violation + threshold_violation,
         )
         self.cache.put(evaluation)
         split_predictions = {
@@ -3507,7 +3623,7 @@ class InteractionAwareSearch:
     ) -> frozenset[str]:
         minimum = minimum or self.config.subspace_min_features
         maximum = maximum or self.config.subspace_max_features
-        maximum = min(maximum, self.config.max_features, len(self.features))
+        maximum = min(maximum, (self.config.search_max_features or self.config.max_features), len(self.features))
         minimum = max(minimum, self.config.min_features, len(self.required_features))
         minimum = min(minimum, maximum)
         size = rng.randint(minimum, maximum)
@@ -3682,37 +3798,18 @@ class InteractionAwareSearch:
         last_progress = time.monotonic()
         last_report = last_progress
 
-        def take_device(eligible_devices: set[str]) -> str | None:
+        def take_device() -> str | None:
             if not requires_device:
                 return None
             for _ in range(len(free_devices)):
                 device = free_devices.popleft()
-                if device in eligible_devices:
+                if (
+                    self.resource_manager is None
+                    or self.resource_manager.gpu_device_available(device)
+                ):
                     return device
                 free_devices.append(device)
             return None
-
-        def resource_wait_details(
-            snapshot: ResourceSnapshot | None,
-            allowed: int,
-            eligible_devices: set[str],
-        ) -> str:
-            if self.resource_manager is None or snapshot is None:
-                return f"allowed={allowed}"
-            selected = set(self.execution.gpu_devices)
-            gpu_rows = ", ".join(
-                f"{item.device}:free={item.free_gb:.2f}GB/"
-                f"total={item.total_gb:.2f}GB"
-                for item in snapshot.gpus
-                if item.device in selected
-            ) or "none"
-            return (
-                f"allowed={allowed}; eligible_gpus="
-                f"{sorted(eligible_devices)}; gpu_per_trial="
-                f"{self.resource_manager.gpu_memory_per_trial_gb:.2f}GB; "
-                f"gpu_state=[{gpu_rows}]; ram_available="
-                f"{snapshot.ram_available_gb:.2f}GB"
-            )
 
         def close_worker(state: IsolatedWorkerState) -> None:
             state.process.join(timeout=0.25)
@@ -3788,46 +3885,19 @@ class InteractionAwareSearch:
                 ),
             )
 
-        last_snapshot: ResourceSnapshot | None = None
-        last_allowed = 0
-        last_eligible_devices: set[str] = set()
-
         while pending or running:
-            if self.resource_manager is not None:
-                last_snapshot = self.resource_manager.snapshot()
-                allowed = self.resource_manager.allowed_concurrency(
-                    len(running),
-                    len(pending),
-                    "process_scheduler",
-                    snapshot=last_snapshot,
+            allowed = (
+                self.resource_manager.allowed_concurrency(
+                    len(running), len(pending), "process_scheduler"
                 )
-                eligible_devices = (
-                    set(
-                        self.resource_manager.available_gpu_devices(
-                            last_snapshot
-                        )
-                    )
-                    & set(free_devices)
-                    if requires_device
-                    else set()
-                )
-                if requires_device:
-                    allowed = min(
-                        allowed,
-                        len(running) + len(eligible_devices),
-                    )
-            else:
-                allowed = self.parallel_trials
-                eligible_devices = set(free_devices)
-            last_allowed = allowed
-            last_eligible_devices = set(eligible_devices)
+                if self.resource_manager is not None
+                else self.parallel_trials
+            )
             submitted = False
             while pending and len(running) < allowed:
-                device = take_device(eligible_devices)
+                device = take_device()
                 if requires_device and device is None:
                     break
-                if device is not None:
-                    eligible_devices.discard(device)
                 index, subset = pending.popleft()
                 attempts[index] += 1
                 channel = context.Queue()
@@ -3866,12 +3936,7 @@ class InteractionAwareSearch:
                 if time.monotonic() - last_progress >= wait_timeout:
                     raise RuntimeError(
                         "Resource wait timeout: no safe isolated-worker slot "
-                        "became available; "
-                        + resource_wait_details(
-                            last_snapshot,
-                            last_allowed,
-                            last_eligible_devices,
-                        )
+                        "became available"
                     )
                 time.sleep(min(interval, 0.25))
                 continue
@@ -4533,7 +4598,7 @@ class InteractionAwareSearch:
                     item.subset,
                     self.features,
                     self.config.min_features,
-                    self.config.max_features,
+                    (self.config.search_max_features or self.config.max_features),
                     rng,
                     self.required_features,
                 )
@@ -4543,7 +4608,7 @@ class InteractionAwareSearch:
                 self._random_subset(
                     rng,
                     minimum=self.config.min_features,
-                    maximum=self.config.max_features,
+                    maximum=(self.config.search_max_features or self.config.max_features),
                 )
             )
             base.update(coalition.members)
@@ -4552,7 +4617,7 @@ class InteractionAwareSearch:
                     base,
                     self.features,
                     self.config.min_features,
-                    self.config.max_features,
+                    (self.config.search_max_features or self.config.max_features),
                     rng,
                     self.required_features,
                 )
@@ -4562,7 +4627,7 @@ class InteractionAwareSearch:
                 self._random_subset(
                     rng,
                     minimum=self.config.min_features,
-                    maximum=self.config.max_features,
+                    maximum=(self.config.search_max_features or self.config.max_features),
                 )
             )
         return population[: self.config.population_size]
@@ -4577,7 +4642,7 @@ class InteractionAwareSearch:
             and rng.random() < self.config.coalition_mutation_probability
         ):
             coalition = self._choose_coalition(
-                rng, selected, self.config.max_features
+                rng, selected, (self.config.search_max_features or self.config.max_features)
             )
             if coalition:
                 selected.update(coalition.members)
@@ -4603,7 +4668,7 @@ class InteractionAwareSearch:
             selected,
             self.features,
             self.config.min_features,
-            self.config.max_features,
+            (self.config.search_max_features or self.config.max_features),
             rng,
             self.required_features,
         )
@@ -4620,7 +4685,7 @@ class InteractionAwareSearch:
             if (
                 inherited
                 and members & child
-                and len(child | members) <= self.config.max_features
+                and len(child | members) <= (self.config.search_max_features or self.config.max_features)
                 and rng.random() < self.config.coalition_preservation_probability
             ):
                 child.update(members)
@@ -4628,7 +4693,7 @@ class InteractionAwareSearch:
             child,
             self.features,
             self.config.min_features,
-            self.config.max_features,
+            (self.config.search_max_features or self.config.max_features),
             rng,
             self.required_features,
         )
@@ -4719,7 +4784,7 @@ class InteractionAwareSearch:
                             subset | {feature},
                             self.features,
                             self.config.min_features,
-                            self.config.max_features,
+                            (self.config.search_max_features or self.config.max_features),
                             rng,
                             self.required_features,
                         )
@@ -4730,7 +4795,7 @@ class InteractionAwareSearch:
                             subset | set(coalition.members),
                             self.features,
                             self.config.min_features,
-                            self.config.max_features,
+                            (self.config.search_max_features or self.config.max_features),
                             rng,
                             self.required_features,
                         )
@@ -5541,7 +5606,7 @@ def run_preflight(config_path: str | Path) -> dict[str, Any]:
     workloads: dict[str, Any] = {}
     train_rows = inventories["train"]["rows"]
     valid_rows = inventories["valid"]["rows"]
-    feature_budget = min(feature_count, cfg.search.max_features)
+    feature_budget = min(feature_count, (cfg.search.search_max_features or cfg.search.max_features))
     for fidelity, (train_fraction, valid_fraction) in fractions.items():
         estimated_train = math.ceil(train_rows * train_fraction)
         estimated_valid = math.ceil(valid_rows * valid_fraction)
@@ -5559,19 +5624,17 @@ def run_preflight(config_path: str | Path) -> dict[str, Any]:
             "seeds": 3 if fidelity == "confirm" else 1,
             "dense_matrix_upper_bound_gb": dense_gb,
         }
-    baseline_feature_budget = min(feature_count, cfg.search.max_features)
     baseline_dense_gb = (
         (train_rows + valid_rows)
-        * baseline_feature_budget
+        * feature_count
         * 8
         / float(1024**3)
     )
     warnings = []
-    if feature_count > cfg.search.max_features:
+    if feature_count > (cfg.search.search_max_features or cfg.search.max_features):
         warnings.append(
-            "The reference baseline and initial interaction model are capped "
-            "at search.max_features; the complete feature universe remains "
-            "available to random-subspace and evolutionary search"
+            "The all-feature baseline exceeds search_max_features and may require "
+            "substantially more memory than a search trial"
         )
     if (
         cfg.execution.backend == "local"
@@ -5624,8 +5687,7 @@ def run_preflight(config_path: str | Path) -> dict[str, Any]:
         "inventories": inventories,
         "workloads": workloads,
         "baseline": {
-            "features": baseline_feature_budget,
-            "input_features": feature_count,
+            "features": feature_count,
             "dense_matrix_upper_bound_gb": baseline_dense_gb,
         },
         "execution": {
@@ -5790,7 +5852,7 @@ def run_pipeline(config_path: str | Path) -> None:
             ]
         )
         if feature in features
-    ][: cfg.search.max_features]
+    ][: (cfg.search.search_max_features or cfg.search.max_features)]
     calibration_fidelity = "search"
     if resource_manager is not None:
         resource_manager.wait_for_single_trial("calibration_wait")
@@ -5872,39 +5934,26 @@ def run_pipeline(config_path: str | Path) -> None:
             cfg, fidelities, cache, resource_manager=resource_manager
         )
 
-    # A full-input baseline is not a valid candidate when the final model is
-    # capped by search.max_features. Reuse the calibrated, bounded reference
-    # subset instead: it is representative of a real search trial and avoids
-    # an unnecessary 1000+ feature GPU fit before the actual search starts.
-    reference_features = _bounded_reference_features(
-        features,
-        calibration_subset,
-        cfg.search.max_features,
-    )
-    _event(
-        "baseline_started",
-        n_features=len(reference_features),
-        input_features=len(features),
-    )
+    _event("baseline_started", n_features=len(features))
     if resource_manager is not None:
         resource_manager.wait_for_single_trial("baseline_wait")
     if isolate_local:
         baseline_runner = new_search()
         baseline = baseline_runner._evaluate_many_raw(
-            [frozenset(reference_features)], "search"
+            [frozenset(features)], "search"
         )[0]
     else:
-        baseline = evaluator.evaluate(reference_features, "search")
+        baseline = evaluator.evaluate(features, "search")
     _event("baseline_completed", valid_metric=baseline.valid_metric)
     interaction_cache = evaluator._interaction_cache_path(
-        reference_features, "search", cfg.search.interaction_pairs
+        features, "search", cfg.search.interaction_pairs
     )
     if isolate_local and not interaction_cache.exists():
         interaction_result = run_isolated_catboost_action(
             evaluator,
             resource_manager,
             "interaction_pairs",
-            reference_features,
+            features,
             "search",
             interaction_limit=cfg.search.interaction_pairs,
         )
@@ -5914,7 +5963,7 @@ def run_pipeline(config_path: str | Path) -> None:
         ]
     else:
         interactions = evaluator.interaction_pairs(
-            reference_features, "search", cfg.search.interaction_pairs
+            features, "search", cfg.search.interaction_pairs
         )
     _event("interactions_discovered", pairs=len(interactions))
     search = new_search(interactions, checkpoint=True)
@@ -5957,8 +6006,17 @@ def run_pipeline(config_path: str | Path) -> None:
     eligible_baselines = (
         [baseline] if baseline.n_features <= cfg.search.max_features else []
     )
+    final_size_pool = [
+        item for item in [*eligible_baselines, *search_front]
+        if item.n_features <= cfg.search.max_features
+    ]
+    if not final_size_pool:
+        raise RuntimeError(
+            "Search found no candidate within final max_features; "
+            "increase search/local refinement budget or max_features"
+        )
     candidates = choose_finalists(
-        pareto_front([*eligible_baselines, *search_front]),
+        pareto_front(final_size_pool),
         limit=max(10, cfg.search.local_candidates * 2),
         allowed_drop=cfg.search.allowed_metric_drop,
     )

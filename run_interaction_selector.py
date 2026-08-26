@@ -55,6 +55,17 @@ REQUIRED_FEATURES: list[str] = []
 OUTPUT_DIR = PROJECT_ROOT / "interaction_selection_results_v10"
 GENERATED_CONFIG = OUTPUT_DIR / "config.run.yaml"
 
+
+# Метрика и ограничения selector. eval_metric CatBoost подбирается автоматически
+# из PRIMARY_METRIC внутри interaction_subset_selector.py.
+PRIMARY_METRIC = "average_precision"
+FINAL_MAX_FEATURES = 100
+SEARCH_MAX_FEATURES = 150
+MAX_PRIMARY_METRIC_GAP: float | None = None
+MAX_GINI_GAP = 0.15
+MIN_RECALL = 0.50
+MIN_PRECISION = 0.20
+
 # Сначала всегда строится preflight_plan.json. True останавливает запуск после
 # плана ресурсов; False после плана запускает полный подбор комбинаций.
 PLAN_ONLY = False
@@ -154,9 +165,11 @@ def build_config() -> dict[str, Any]:
     # Утвержденные ограничения и метрика отбора комбинаций.
     config["search"].update(
         {
-            "primary_metric": "average_precision",
-            "max_features": 100,
-            "max_gap": 0.15,
+            "primary_metric": PRIMARY_METRIC,
+            "max_features": FINAL_MAX_FEATURES,
+            "search_max_features": SEARCH_MAX_FEATURES,
+            "max_primary_metric_gap": MAX_PRIMARY_METRIC_GAP,
+            "max_gini_gap": MAX_GINI_GAP,
         }
     )
     config["robust_validation"].update(
@@ -169,10 +182,12 @@ def build_config() -> dict[str, Any]:
     )
     config["decision_threshold"].update(
         {
-            "min_recall": 0.50,
-            "min_precision": 0.20,
+            "min_recall": MIN_RECALL,
+            "min_precision": MIN_PRECISION,
             "objective": "max_precision",
             "require_oos_feasible": OOS_PATH is not None,
+            "enforce_during_search": True,
+            "enforce_fidelities": ["search", "confirm"],
         }
     )
 
@@ -207,7 +222,6 @@ def build_config() -> dict[str, Any]:
         {
             "task_type": "GPU",
             "gpu_ram_part": GPU_RAM_PART,
-            "eval_metric": "PRAUC:type=Classic;use_weights=true",
             "learning_rate": 0.08844,
             "depth": 8,
             "l2_leaf_reg": 20.075,

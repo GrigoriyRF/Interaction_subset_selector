@@ -79,7 +79,9 @@ search:
   # Supported: average_precision, roc_auc, gini, logloss, brier.
   primary_metric: average_precision
   min_features: 10
+  # Final production subset cap. Search may temporarily explore larger subsets.
   max_features: 100
+  search_max_features: 150
 
   # Minipatch/random-subspace exploration.
   random_subspaces: 60
@@ -115,7 +117,10 @@ search:
   local_rounds: 2
 
   # Constraints and final compact-set decision rule.
-  max_gap: 0.15
+  # Optional primary-metric train/valid gap. null disables it.
+  max_primary_metric_gap: null
+  # Hard train/valid Gini gap, independent of primary_metric.
+  max_gini_gap: 0.15
   allowed_metric_drop: 0.002
 
   # Train every proposal cheaply, then promote only a Pareto-diverse fraction.
@@ -159,6 +164,9 @@ decision_threshold:
   objective: max_precision  # max_precision or max_f1
   # If true, a subset that violates either OOS constraint cannot win.
   require_oos_feasible: true
+  # Reject search/confirm subsets that cannot reach both precision/recall floors.
+  enforce_during_search: true
+  enforce_fidelities: [search, confirm]
 
 execution:
   # local uses isolated processes (or opt-in threads) on one host; ray uses a
@@ -239,8 +247,7 @@ model_params:
   # CatBoost defaults to 0.95 and can reserve almost the entire card even when
   # the model needs less. Keep headroom for the worker and resource monitor.
   gpu_ram_part: 0.70
-  # Match early stopping to the primary objective above.
-  eval_metric: "PRAUC:type=Classic;use_weights=true"
+  # eval_metric is derived automatically from search.primary_metric.
   learning_rate: 0.05
   depth: 7
   l2_leaf_reg: 10.0

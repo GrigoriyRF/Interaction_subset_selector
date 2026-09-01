@@ -7,10 +7,24 @@ arnsdpsbx_t_team_ova_sva_2.pri_model_lib_analysis
 агрегирует данные и не сохраняет персональные/текстовые детали.
 """
 
+import os
+import sys
 from functools import reduce
 from typing import List
 
-from pyspark import StorageLevel
+
+os.environ["SPARK_MAJOR_VERSION"] = "3.5.1"
+os.environ["SPARK_HOME"] = "/usr/sdp/current/spark3.5.1-client/"
+os.environ["PYSPARK_DRIVER"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
+sys.path.insert(0, "/usr/sdp/current/spark3.5.1-client/python/")
+sys.path.insert(
+    0,
+    "/usr/sdp/current/spark3.5.1-client/python/lib/py4j-0.10.9.7-src.zip",
+)
+
+from pyspark import SparkConf, StorageLevel
 from pyspark.sql import DataFrame, SparkSession, functions as F
 
 
@@ -22,7 +36,38 @@ STALE_MONITORING_DAYS = 365
 CRITICAL_SIGNIFICANCE = ("A", "B")
 SHOW_ROWS = 300
 
-spark = SparkSession.builder.enableHiveSupport().getOrCreate()
+conf = (
+    SparkConf()
+    .setAppName("PGS")
+    .setMaster("yarn")
+    .set("spark.executor.cores", "2")
+    .set("spark.executor.memory", "6g")
+    .set("spark.executor.memoryOverhead", "1g")
+    .set("spark.driver.memory", "6g")
+    .set("spark.driver.maxResultSize", "8g")
+    .set("spark.shuffle.service.enabled", "true")
+    .set("spark.hadoop.mapreduce.input.fileinputformat.input.dir.recursive", "true")
+    .set("spark.dynamicAllocation.enabled", "true")
+    .set("spark.dynamicAllocation.executorIdleTimeout", "120s")
+    .set("spark.dynamicAllocation.cachedExecutorIdleTimeout", "600s")
+    .set("spark.dynamicAllocation.initialExecutors", "3")
+    .set("spark.dynamicAllocation.maxExecutors", "12")
+    .set("spark.dynamicAllocation.shuffleTracking.enabled", "true")
+    .set("spark.port.maxRetries", "150")
+    .set("dfs.replication", "2")
+    .set("spark.sql.parquet.writeLegacyFormat", "true")
+    .set("spark.sql.parquet.compression.codec", "snappy")
+    .set("parquet.block.size", str(128 * 1024 * 1024))
+    .set("dfs.block.size", str(128 * 1024 * 1024))
+    .set("spark.sql.session.timeZone", "Europe/Moscow")
+)
+
+spark = (
+    SparkSession.builder
+    .config(conf=conf)
+    .enableHiveSupport()
+    .getOrCreate()
+)
 
 # Закрывающие статусы задаются regex, чтобы покрыть русские и английские коды.
 CLOSED_STATUS_RE = r"DONE|COMPLETE|COMPLETED|CLOSED|CANCEL|CANCELED|REJECT|ARCHIV|ЗАВЕРШ|ЗАКРЫТ|ОТМЕН|ОТКЛОН"

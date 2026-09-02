@@ -56,11 +56,8 @@ conf = (
     .set("spark.dynamicAllocation.maxExecutors", "12")
     .set("spark.dynamicAllocation.shuffleTracking.enabled", "true")
     .set("spark.port.maxRetries", "150")
-    .set("dfs.replication", "2")
     .set("spark.sql.parquet.writeLegacyFormat", "true")
     .set("spark.sql.parquet.compression.codec", "snappy")
-    .set("parquet.block.size", str(128 * 1024 * 1024))
-    .set("dfs.block.size", str(128 * 1024 * 1024))
     .set("spark.sql.session.timeZone", "Europe/Moscow")
 )
 
@@ -363,23 +360,40 @@ def add_query(
 
 
 def add_details(sql_body: str) -> None:
-    """Добавляет версии/сущности, попавшие в числитель риск-индикатора."""
+    """Добавляет только недостатки, однозначно связанные с версией модели/GenAI.
+
+    Записи источников без связи с версией остаются в агрегатах и контроле
+    ссылочной целостности, но не попадают в версионную детализацию: для них
+    невозможно корректно сформировать model_ver_sid/genai_ver_sid.
+    """
     raw = spark.sql(sql_body)
-    details.append(
-        raw.select(
-            F.col("query_id").cast("int").alias("query_id"),
-            F.col("query_name").cast("string").alias("query_name"),
-            F.col("entity_type").cast("string").alias("entity_type"),
-            F.col("model_ver_sid").cast("string").alias("model_ver_sid"),
-            F.col("genai_ver_sid").cast("string").alias("genai_ver_sid"),
-            F.col("source_entity_type").cast("string").alias("source_entity_type"),
-            F.col("source_entity_sid").cast("string").alias("source_entity_sid"),
-            F.col("issue_name").cast("string").alias("issue_name"),
-            F.col("dim_1_value").cast("string").alias("dim_1_value"),
-            F.col("dim_2_value").cast("string").alias("dim_2_value"),
-            F.current_date().alias("as_of_dt"),
-        ).dropDuplicates()
+    selected = raw.select(
+        F.col("query_id").cast("int").alias("query_id"),
+        F.col("query_name").cast("string").alias("query_name"),
+        F.col("entity_type").cast("string").alias("entity_type"),
+        F.col("model_ver_sid").cast("string").alias("model_ver_sid"),
+        F.col("genai_ver_sid").cast("string").alias("genai_ver_sid"),
+        F.col("source_entity_type").cast("string").alias("source_entity_type"),
+        F.col("source_entity_sid").cast("string").alias("source_entity_sid"),
+        F.col("issue_name").cast("string").alias("issue_name"),
+        F.col("dim_1_value").cast("string").alias("dim_1_value"),
+        F.col("dim_2_value").cast("string").alias("dim_2_value"),
+        F.current_date().alias("as_of_dt"),
     )
+
+    model_ver_present = (
+        F.col("model_ver_sid").isNotNull()
+        & ~F.lower(F.trim(F.col("model_ver_sid"))).isin("", "null", "none")
+    )
+    genai_ver_present = (
+        F.col("genai_ver_sid").isNotNull()
+        & ~F.lower(F.trim(F.col("genai_ver_sid"))).isin("", "null", "none")
+    )
+    identified = selected.filter(
+        ((F.col("entity_type") == "MODEL") & model_ver_present)
+        | ((F.col("entity_type") == "GENAI") & genai_ver_present)
+    )
+    details.append(identified.dropDuplicates())
 
 
 def dist(qid, name, domain, entity, metric, d1_name, d2_name, sources, note, from_sql, d1, d2="NULL"):
@@ -1672,9 +1686,17 @@ detail_df = reduce(lambda left, right: left.unionByName(right), details).persist
 if final_df.filter(~F.col("entity_type").isin("MODEL", "GENAI", "ALL")).limit(1).count():
     raise RuntimeError("В агрегатах найдено недопустимое значение entity_type")
 
+model_ver_missing = (
+    F.col("model_ver_sid").isNull()
+    | F.lower(F.trim(F.col("model_ver_sid"))).isin("", "null", "none")
+)
+genai_ver_missing = (
+    F.col("genai_ver_sid").isNull()
+    | F.lower(F.trim(F.col("genai_ver_sid"))).isin("", "null", "none")
+)
 if detail_df.filter(
-    ((F.col("entity_type") == "MODEL") & F.col("model_ver_sid").isNull())
-    | ((F.col("entity_type") == "GENAI") & F.col("genai_ver_sid").isNull())
+    ((F.col("entity_type") == "MODEL") & model_ver_missing)
+    | ((F.col("entity_type") == "GENAI") & genai_ver_missing)
 ).limit(1).count():
     raise RuntimeError("В детализации отсутствует идентификатор версии для MODEL/GENAI")
 

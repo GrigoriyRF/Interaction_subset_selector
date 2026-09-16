@@ -21,16 +21,26 @@ from datetime import datetime
 from functools import reduce
 from typing import List
 
-# Работает и внутри уже запущенного ноутбука, и в окружении исходного скрипта.
-try:
-    import pyspark
-except ImportError:
-    spark_home = '/usr/sdp/current/spark3.5.1-client/'
-    os.environ.setdefault('SPARK_HOME', spark_home)
-    os.environ.setdefault('SPARK_MAJOR_VERSION', '3.5.1')
-    os.environ.setdefault('PYSPARK_PYTHON', sys.executable)
-    sys.path[:0] = [spark_home + 'python/',
-                   spark_home + 'python/lib/py4j-0.10.9.7-src.zip']
+# Инициализация ДО импорта PySpark, как в исходном скрипте.
+# Python 3.6 из старого ядра не поддерживается PySpark 3.5.
+if sys.version_info < (3, 8):
+    raise RuntimeError(
+        'Требуется ядро Python >= 3.8 для Spark 3.5.x. Сейчас: ' + sys.version +
+        '. Выберите совместимое ядро Jupyter, перезапустите его и выполните скрипт первой ячейкой.')
+spark_home = Path('/usr/sdp/current/spark3.5.1-client/')
+if 'pyspark' not in sys.modules and spark_home.is_dir():
+    os.environ['SPARK_HOME'] = str(spark_home)
+    os.environ['SPARK_MAJOR_VERSION'] = '3.5.1'
+    os.environ['PYSPARK_DRIVER'] = sys.executable
+    os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
+    sys.path[:0] = [str(spark_home / 'python'),
+                   str(spark_home / 'python/lib/py4j-0.10.9.7-src.zip')]
+import pyspark
+if tuple(int(x) for x in pyspark.__version__.split('.')[:2]) != (3, 5):
+    raise RuntimeError(
+        'Нужен PySpark 3.5.x; загружен ' + pyspark.__version__ + ' из ' + pyspark.__file__ +
+        '. Перезапустите совместимое ядро и выполните скрипт первой ячейкой. '
+        'Уже импортированный PySpark нельзя переключить изменением SPARK_HOME.')
 from pyspark import StorageLevel
 from pyspark.sql import SparkSession, DataFrame, Window, functions as F
 
@@ -58,14 +68,74 @@ for handler in (logging.StreamHandler(), logging.FileHandler(
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     log.addHandler(handler)
 
-spark = SparkSession.getActiveSession() or (
-    SparkSession.builder.appName('model_current_audit').enableHiveSupport().getOrCreate())
+def initialize_spark():
+    active = SparkSession.getActiveSession()
+    if active is not None:
+        session = active
+    else:
+        builder = (SparkSession.builder.appName('model_current_audit')
+            .config('spark.executor.cores', '2')
+            .config('spark.executor.memory', '6g')
+            .config('spark.executor.memoryOverhead', '1g')
+            .config('spark.driver.memory', '6g')
+            .config('spark.driver.maxResultSize', '4g')
+            .config('spark.dynamicAllocation.enabled', 'true')
+            .config('spark.dynamicAllocation.initialExecutors', '3')
+            .config('spark.dynamicAllocation.maxExecutors', '12')
+            .config('spark.shuffle.service.enabled', 'true'))
+        if spark_home.is_dir():
+            builder = builder.master('yarn')
+        session = builder.enableHiveSupport().getOrCreate()
+    log.info('Python=%s; PySpark=%s; module=%s; Spark=%s; master=%s; catalog=%s',
+        sys.version.split()[0], pyspark.__version__, pyspark.__file__, session.version,
+        session.sparkContext.master, session.conf.get('spark.sql.catalogImplementation'))
+    if tuple(int(x) for x in session.version.split('.')[:2]) != (3, 5):
+        raise RuntimeError('JVM Spark ' + session.version + ' не соответствует PySpark 3.5.x. '
+                           'Перезапустите ядро; существующий контекст автоматически не останавливается.')
+    return session
+
+spark = initialize_spark()
 spark.conf.set('spark.sql.session.timeZone', 'Europe/Moscow')
 AS_OF_DT = str(spark.sql('SELECT current_date() d').first()['d'])
 AS_OF_TS = str(spark.sql('SELECT current_timestamp() t').first()['t'])
 audit = []
 cached = []
 outputs = {}
+
+def preflight():
+    """Проверка каталога и чтения до выполнения 31 контроля. Ничего не меняет."""
+    catalog = spark.conf.get('spark.sql.catalogImplementation')
+    if catalog != 'hive':
+        raise RuntimeError(
+            'Spark запущен с catalogImplementation=' + catalog + ', нужен hive. '
+            'Перезапустите ядро и запустите скрипт первой ячейкой. '
+            'enableHiveSupport() не исправляет уже созданный in-memory каталог.')
+    required_tables = ['t_model', 't_model_ver', 't_model_ver_anlt_dtl',
+                       't_ent_param_chg', 't_sample_data', 't_metric', 't_valid']
+    # Не подставляем metastore URI: используется конфигурация рабочего кластера.
+    try:
+        spark.sql('SHOW TABLES IN `' + SRC_DB + '`').limit(1).collect()
+    except Exception as exc:
+        raise RuntimeError(
+            'Spark не видит/не может открыть схему ' + SRC_DB + '. '
+            'Если схема видна в Hue, проверьте конфигурацию Hive Metastore '
+            '(hive-site.xml, HADOOP_CONF_DIR/SPARK_CONF_DIR) и учётные данные '
+            'Spark-сессии. Существование схемы в Hue не гарантирует доступ из Spark. '
+            'Исходная ошибка: ' + str(exc)) from exc
+    failures = []
+    for table in required_tables:
+        name = SRC_DB + '.' + table
+        try:
+            df = spark.table(name)
+            # Проверка каталога + минимальное фактическое чтение; данные не печатаются.
+            df.limit(1).collect()
+            log.info('Источник доступен: %s', name)
+        except Exception as exc:
+            failures.append(name + ': ' + str(exc))
+    if failures:
+        raise RuntimeError('Нет доступа к обязательным источникам:\n' + '\n'.join(failures) +
+            '\nПроверьте каталог/metastore и права пользователя Spark. '
+            'Имена таблиц взяты из исходных файлов и автоматически не заменяются.')
 
 def record(stage, count, note=''):
     audit.append((stage, int(count), note))
@@ -916,6 +986,7 @@ def main():
     global version_context, risk_summary, risk_details, control_rollup
     global version_report, model_change_log, red_production
     log.info('Старт %s; срез %s; конфигурация %s', RUN_ID, AS_OF_TS, CONFIG)
+    preflight()
     version_context = prepare_scope()
     prepare_views()
     build_controls()

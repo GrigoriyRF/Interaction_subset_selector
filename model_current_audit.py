@@ -11,6 +11,8 @@ run_diagnostics. Все результаты имеют run_id и as_of_dt.
 Импорт безопасен: PySpark импортируется только внутри run_audit. Нужен Spark 3.5+.
 
 latest_created: одна последняя созданная версия на модель, по model_ver_crtn_dttm.
+latest_production: сначала действующие эксплуатируемые версии, затем одна
+последняя по model_ver_crtn_dttm на модель. Требует production_only=True.
 current_all: все бизнес-актуальные SID версий, включая параллельные версии.
 Закрытые статусы исключаются ПОСЛЕ выбора версии, без возврата к старой версии.
 production_only: дополнительный фильтр model_ver_prom_expl_flag.
@@ -44,8 +46,10 @@ def run_audit(
                            'Настройте совместимую сессию до вызова run_audit.')
     if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', source_db):
         raise ValueError('source_db: укажите простое имя схемы Hive')
-    if version_mode not in ('latest_created', 'current_all'):
-        raise ValueError('version_mode: latest_created или current_all')
+    if version_mode not in ('latest_created', 'current_all', 'latest_production'):
+        raise ValueError('version_mode: latest_created, current_all или latest_production')
+    if version_mode == 'latest_production' and not production_only:
+        raise ValueError('Для latest_production укажите production_only=True')
     CONFIG = dict(version_mode=version_mode, production_only=production_only)
     SRC_DB = source_db
     MIN_GROUP_FOR_P90 = 5
@@ -236,8 +240,8 @@ def run_audit(
             if mv.groupBy('model_sid').count().filter('count > 1').limit(1).count():
                 raise ValueError('Несколько последних версий с одинаковой датой создания; '
                                  'требуется бизнес-правило выбора или current_all')
-        elif mode != 'current_all':
-            raise ValueError('version_mode: latest_created или current_all')
+        elif mode not in ('current_all', 'latest_production'):
+            raise ValueError('version_mode: latest_created, current_all или latest_production')
         record('selected_before_status_filter', mv.count(), mode)
         # Не подменяем последнюю закрытую версию более старой открытой.
         mv = mv.filter(~F.upper(F.coalesce(F.col('model_ver_stts_name'), F.lit('')))
@@ -249,6 +253,21 @@ def run_audit(
         context = mv.join(models, 'model_sid', 'left').join(anlt, 'model_ver_sid', 'left')
         if CONFIG['production_only']:
             context = context.filter(F.expr(truth('model_ver_prom_expl_flag')))
+        if mode == 'latest_production':
+            record('production_versions_before_latest', context.count())
+            if context.filter(F.col('model_sid').isNull() |
+                              F.col('model_ver_crtn_dttm').isNull()).limit(1).count():
+                raise ValueError('Для latest_production нужны model_sid и дата создания '
+                                 'у всех эксплуатируемых версий')
+            if context.filter(F.col('model_ver_crtn_dttm') >
+                              F.lit(AS_OF_TS).cast('timestamp')).limit(1).count():
+                raise ValueError('Дата создания эксплуатируемой версии в будущем')
+            context = context.withColumn('_r', F.dense_rank().over(
+                Window.partitionBy('model_sid').orderBy(F.col('model_ver_crtn_dttm').desc()))
+                ).filter('_r = 1').drop('_r')
+            if context.groupBy('model_sid').count().filter('count > 1').limit(1).count():
+                raise ValueError('Несколько эксплуатируемых версий с одинаковой последней '
+                                 'датой создания: требуется бизнес-правило выбора')
         context = context.persist(StorageLevel.MEMORY_AND_DISK)
         cached.append(context)
         record('scope_versions', context.count())
